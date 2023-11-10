@@ -38,9 +38,10 @@ type change struct {
 }
 
 var (
-	factory   CommandFactory
-	env       envelope
-	accountID string
+	factory       CommandFactory
+	env           envelope
+	accountID     string
+	assumeRoleARN string
 )
 
 func init() {
@@ -59,6 +60,9 @@ func init() {
 	if accountID, err = getAccountIDFromAssumeRole(); err != nil {
 		log.Fatal(fmt.Errorf("could not get account ID: %s", err))
 	}
+	if assumeRoleARN, err = getAssumeRoleARN(); err != nil {
+		log.Fatal(fmt.Errorf("could not get assume role ARN: %s", err))
+	}
 
 	factory = getDefaultFactory()
 	fmt.Println("Loaded config")
@@ -70,7 +74,7 @@ func main() {
 		if cp.Change.Actions[0] == "create" {
 			cmd, err := factory.Command(cp)
 			if err != nil {
-				//fmt.Println(err)
+				fmt.Println(err)
 				continue
 			}
 			out, exerr := cmd.CombinedOutput()
@@ -107,4 +111,14 @@ func getAccountIDFromAssumeRole() (string, error) {
 	}
 
 	return arn.AccountID, nil
+}
+
+func getAssumeRoleARN() (string, error) {
+	plan := gjson.ParseBytes(env.Configuration)
+	assumeRoleARN := plan.Get("provider_config.aws.expressions.assume_role.0.role_arn.constant_value")
+	if !arn.IsARN(assumeRoleARN.Str) {
+		return "", fmt.Errorf("not an ARN: %s", assumeRoleARN.Str)
+	}
+
+	return assumeRoleARN.String(), nil
 }

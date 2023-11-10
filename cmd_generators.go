@@ -1,9 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	sts2 "github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/tidwall/gjson"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -27,6 +35,9 @@ const (
 	typeAwsLambdaFunction   = "aws_lambda_function"
 	typeAwsLambdaPermission = "aws_lambda_permission"
 
+	typeAwsLb         = "aws_lb"
+	typeAwsLbListener = "aws_lb_listener"
+
 	typeAwsRoute53Record = "aws_route53_record"
 
 	typeAwsSecurityGroupRule = "aws_security_group_rule"
@@ -49,7 +60,18 @@ const (
 
 var (
 	errorGenNotFound = func(name string) error { return fmt.Errorf("type: %s not found", name) }
+	cfg              aws.Config
+	lbMapping        = make(map[string]map[string]string)
 )
+
+func init() {
+	var err error
+	cfg, err = config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(128)
+	}
+}
 
 func (f *defaultCmdFactory) Command(cp resourceChange) (*exec.Cmd, error) {
 	c, ok := f.gens[cp.ChangePartType]
@@ -80,6 +102,8 @@ func getDefaultFactory() CommandFactory {
 	f.gens[typeAwsRoute53Record] = importAwsRoute53Record
 	f.gens[typeAwsSecurityGroupRule] = importAwsSecurityGroupRule
 	f.gens[typeAwsCloudwatchMetricAlarm] = importAwsCloudwatchMetricAlarm
+	f.gens[typeAwsLbListener] = importAwsLbListener
+	f.gens[typeAwsLb] = importAwsLb
 
 	return f
 }
@@ -325,4 +349,68 @@ func importAwsSecurityGroupRule(change resourceChange) (*exec.Cmd, error) {
 	identifier := fmt.Sprintf("%s_%s_%s_%s_%s_%s", sgId, ruleType, protocol, fromPort, toPort, cidrCSV)
 	return exec.Command(cmdTerraform, cmdTerraformImport, change.Address, identifier), nil
 
+}
+
+func importAwsLb(change resourceChange) (*exec.Cmd, error) {
+	plan := gjson.ParseBytes(change.Change.Before)
+	arn := plan.Get("arn")
+
+	return exec.Command(cmdTerraform, cmdTerraformImport, change.Address, arn.String()), nil
+}
+
+func importAwsLbListener(change resourceChange) (*exec.Cmd, error) {
+	plan := gjson.ParseBytes(change.Change.After)
+	lbArn := plan.Get("load_balancer_arn").String()
+
+	err := prepareLBMapping(lbArn)
+	if err != nil {
+		return nil, err
+	}
+
+	listenerPort := strconv.Itoa(int(plan.Get("port").Int()))
+	listenerArn, ok := lbMapping[lbArn][listenerPort]
+	if !ok {
+		return nil, fmt.Errorf("no listener found with port %s for LB %s", listenerPort, lbArn)
+	}
+
+	return exec.Command(cmdTerraform, cmdTerraformImport, change.Address, listenerArn), nil
+}
+
+func prepareLBMapping(lbArn string) error {
+	listeners, ok := lbMapping[lbArn]
+	if ok && len(listeners) > 0 {
+		return nil
+	}
+
+	sts := sts2.NewFromConfig(cfg)
+	var roleSessionName = "crufty-bar"
+	arres, arerr := sts.AssumeRole(context.TODO(), &sts2.AssumeRoleInput{RoleArn: &assumeRoleARN, RoleSessionName: &roleSessionName})
+	if arerr != nil {
+		return fmt.Errorf("failed assuming role '%s': %s", assumeRoleARN, arerr)
+	}
+
+	prodCfg, cfgerr := config.LoadDefaultConfig(
+		context.TODO(),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			*arres.Credentials.AccessKeyId,
+			*arres.Credentials.SecretAccessKey,
+			*arres.Credentials.SessionToken,
+		)))
+	if cfgerr != nil {
+		return fmt.Errorf("failed reloading config: %s", cfgerr)
+	}
+	cli := elasticloadbalancingv2.NewFromConfig(prodCfg)
+
+	res, err := cli.DescribeListeners(context.TODO(), &elasticloadbalancingv2.DescribeListenersInput{LoadBalancerArn: &lbArn})
+	if err != nil {
+		return err
+	}
+
+	lbMapping[lbArn] = make(map[string]string)
+	for _, lbl := range res.Listeners {
+		port := strconv.Itoa(int(*lbl.Port))
+		lbMapping[lbArn][port] = *lbl.ListenerArn
+	}
+
+	return nil
 }
